@@ -19,9 +19,9 @@ The script has been used successfully multiple times in a real production enviro
 
 ### Environment Variables
 
-    *CLOUDFLARE_API_TOKEN*= "Your Cloudflare API Token (not Key)"
-    *CLOUDFLARE_ZONE_ID*= "Your Cloudflare Zone ID" - # Currently only supports 1 ID per script run
-    *IPQS_API_KEY*= "Your IPQS API Key"
+    CLOUDFLARE_API_TOKEN= "Your Cloudflare API Token (not Key)"
+    CLOUDFLARE_ZONE_ID= "Your Cloudflare Zone ID" - # Currently only supports 1 ID per script run
+    IPQS_API_KEY= "Your IPQS API Key"
 
 ## How to Use
 
