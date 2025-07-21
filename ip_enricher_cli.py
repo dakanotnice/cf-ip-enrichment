@@ -1,4 +1,3 @@
-
 import csv
 import json
 import requests
@@ -33,10 +32,11 @@ def get_auth_headers(token):
         "Content-Type": "application/json",
     }
 
-def fetch_cloudflare_ips(zone_id, api_token, rule_type='access_rules'):
+def fetch_cloudflare_ips(zone_id, api_token, rule_type='access_rules', filter_no_notes=False):
     """
     Fetches IPs from Cloudflare based on the specified rule type.
     :param rule_type: 'access_rules' or 'zone_lockdown'.
+    :param filter_no_notes: If True, only return rules with no notes.
     """
     if not api_token or not zone_id:
         logging.critical(f"Cloudflare API token and Zone ID are required.")
@@ -54,7 +54,7 @@ def fetch_cloudflare_ips(zone_id, api_token, rule_type='access_rules'):
         return []
 
     headers = get_auth_headers(api_token)
-    ips = []
+    rules_data = []
     page_number = 1
     per_page = 150
 
@@ -80,20 +80,31 @@ def fetch_cloudflare_ips(zone_id, api_token, rule_type='access_rules'):
 
             if rule_type == 'access_rules':
                 for rule in rules:
+                    if filter_no_notes and rule.get('notes'):
+                        continue
                     if rule.get('configuration', {}).get('target') in ['ip', 'ip_range']:
-                        ips.append(rule['configuration']['value'])
+                        rules_data.append({
+                            'ip': rule['configuration']['value'],
+                            'created_on': rule.get('created_on'),
+                            'modified_on': rule.get('modified_on'),
+                            'notes': rule.get('notes')
+                        })
             elif rule_type == 'zone_lockdown':
                 for rule in rules:
                     for config in rule.get('configurations', []):
                         if config.get('target') == 'ip_range':
-                            ips.append(config['value'])
+                            rules_data.append({
+                                'ip': config['value'],
+                                'created_on': None,
+                                'modified_on': None,
+                                'notes': None
+                            })
             
             page_number += 1
             time.sleep(REQUEST_DELAY)
 
-        unique_ips = list(set(ips))
-        logging.info(f"Found {len(unique_ips)} unique IPs/ranges from {rule_type}.")
-        return unique_ips
+        logging.info(f"Found {len(rules_data)} IPs/ranges from {rule_type}.")
+        return rules_data
 
     except requests.exceptions.RequestException as e:
         logging.error(f"Error fetching Cloudflare rules: {e}")
@@ -138,15 +149,14 @@ def read_ips_from_file(filepath):
         logging.error(f"Input file not found: {filepath}")
         return []
 
-def write_to_csv(data, filename):
-    """Writes enriched data to a CSV file."""
+def write_to_csv(data, filename, fields):
+    """Writes enriched data to a CSV file, only including specified fields."""
     if not data:
         return
-    
-    fieldnames = list(data[0].keys())
+
     try:
         with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer = csv.DictWriter(csvfile, fieldnames=fields, extrasaction='ignore')
             writer.writeheader()
             writer.writerows(data)
         logging.info(f"Data written to {filename}")
@@ -170,13 +180,18 @@ def write_to_json(data, filename):
 def process_ips(ip_list, ipqs_api_key):
     """Orchestrates the enrichment process for a list of IPs."""
     enriched_data = []
-    for ip in ip_list:
+    for item in ip_list:
+        ip = item['ip'] if isinstance(item, dict) else item
         if '/' in ip:
             logging.warning(f"Skipping IP range: {ip}")
             continue
 
         logging.info(f"Enriching IP: {ip}")
         data = {'ip_address': ip, 'timestamp': datetime.now().isoformat()}
+        if isinstance(item, dict):
+            data['created_on'] = item.get('created_on')
+            data['modified_on'] = item.get('modified_on')
+            data['notes'] = item.get('notes')
         
         # IPQS Enrichment
         ipqs_data = query_ipqs(ip, ipqs_api_key)
@@ -195,6 +210,26 @@ def process_ips(ip_list, ipqs_api_key):
         
     return enriched_data
 
+def flatten_for_csv(enriched_data):
+    """Flattens the nested data structure for CSV output."""
+    flat_data = []
+    for item in enriched_data:
+        row = {
+            'ip_address': item['ip_address'],
+            'timestamp': item['timestamp'],
+            'created_on': item.get('created_on'),
+            'modified_on': item.get('modified_on'),
+            'notes': item.get('notes')
+        }
+        if 'ipqs' in item and item['ipqs']:
+            for k, v in item['ipqs'].items():
+                row[f"ipqs_{k}"] = v
+        if 'internetdb' in item and item['internetdb']:
+            for k, v in item['internetdb'].items():
+                row[f"internetdb_{k}"] = v
+        flat_data.append(row)
+    return flat_data
+
 def main():
     """Main CLI entry point."""
     load_dotenv()
@@ -206,6 +241,8 @@ def main():
     group.add_argument('--cf-zone-lockdown', action='store_true', help="Fetch IPs from Cloudflare Zone Lockdown.")
     group.add_argument('--file', type=str, help="Path to a file containing IPs to enrich.")
     group.add_argument('--ip', type=str, help="A single IP address to enrich.")
+    group.add_argument('--cf-access-rules-no-notes', action='store_true', help=argparse.SUPPRESS) # Undocumented on purpose
+
 
     # Cloudflare & API Keys
     parser.add_argument('--cf-zone-id', type=str, default=os.environ.get("CLOUDFLARE_ZONE_ID"))
@@ -221,7 +258,9 @@ def main():
     # Determine IP list from source
     ip_list = []
     if args.cf_access_rules:
-        ip_list = fetch_cloudflare_ips(args.cf_zone_id, args.cf_api_token, 'access_rules')
+        ip_list = fetch_cloudflare_ips(args.cf_zone_id, args.cf_api_token, 'access_rules', filter_no_notes=False)
+    elif args.cf_access_rules_no_notes:
+        ip_list = fetch_cloudflare_ips(args.cf_zone_id, args.cf_api_token, 'access_rules', filter_no_notes=True)
     elif args.cf_zone_lockdown:
         ip_list = fetch_cloudflare_ips(args.cf_zone_id, args.cf_api_token, 'zone_lockdown')
     elif args.file:
@@ -240,18 +279,13 @@ def main():
     if enriched_results:
         output_file = f"{args.output}.{args.format}"
         if args.format == 'csv':
-            # Flatten data for CSV
-            flat_data = []
-            for item in enriched_results:
-                row = {'ip_address': item['ip_address'], 'timestamp': item['timestamp']}
-                if 'ipqs' in item:
-                    for k, v in item['ipqs'].items():
-                        row[f"ipqs_{k}"] = v
-                if 'internetdb' in item:
-                    for k, v in item['internetdb'].items():
-                        row[f"internetdb_{k}"] = v
-                flat_data.append(row)
-            write_to_csv(flat_data, output_file)
+            flat_data = flatten_for_csv(enriched_results)
+            csv_fields = [
+                'ip_address', 'notes', 'internetdb_ports', 'ipqs_ISP', 'ipqs_city',
+                'ipqs_recent_abuse', 'ipqs_tor', 'internetdb_cpes',
+                'created_on', 'modified_on'
+            ]
+            write_to_csv(flat_data, output_file, csv_fields)
         else:
             write_to_json(enriched_results, output_file)
 
